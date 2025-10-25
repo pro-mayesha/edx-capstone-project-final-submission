@@ -1,0 +1,458 @@
+---
+title: "Student Performance: Predicting Final Pass/Fail (UCI Student Performance)"
+author: "Mayesha Maliha Proma"
+date: "`r format(Sys.Date())`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+    toc: true
+    toc_depth: 3
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+header-includes:
+  - \usepackage[strings]{underscore}
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center"
+)
+set.seed(123)
+```
+
+# Executive Summary
+
+The objective of this project is to predict whether a student will pass Mathematics, defined as attaining a final grade of at least 10 out of 20, by utilizing demographic, family, engagement, and prior-performance features. The analysis draws on the student-mat.csv dataset, which includes data on 395 students across 33 variables. The primary target, pass_flag, is derived from the final grade and distinguishes between passing and not passing, with approximately 67 percent of students passing and 33 percent not passing. Rigorous data cleaning and exploration were conducted, and the final grade variable was excluded from the predictors to prevent data leakage. The data was split into training and test sets in an 80 to 20 ratio with stratified sampling to preserve class balance. Random Forest, implemented with the ranger package, and XGBoost were both tuned through five-fold cross-validation and space-filling hyperparameter grids. The models were primarily evaluated using ROC AUC, with PR AUC, accuracy, sensitivity, and specificity also reported. In a representative analysis, the Random Forest model performed extremely well, yielding a ROC AUC near 0.989, PR AUC around 0.975, accuracy roughly 0.949, sensitivity close to 0.923, and specificity about 0.962 on the held-out test set. Prior grades, specifically g1 and g2, proved to be the most influential features, while attendance and behavioral metrics added meaningful predictive value.
+
+# Data and Reproducibility
+
+The dataset is publicly available on the UCI Machine Learning Repository. The code first checks for the presence of a local CSV file, and if it is not found, it automatically downloads and extracts the archive from the UCI source.
+
+```{r packages}
+install_if_missing <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+  }
+}
+
+install_if_missing(c(
+  "tidyverse","tidymodels","janitor","lubridate","stringr",
+  "ranger","xgboost","vip","knitr","rmarkdown","ggplot2"
+))
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidymodels)
+  library(janitor)
+  library(lubridate)
+  library(stringr)
+  library(ranger)
+  library(xgboost)
+  library(vip)
+  library(ggplot2)
+})
+```
+
+```{r get-data}
+get_student_csv <- function() {
+  # Prefer local copies next to the Rmd
+  candidates <- c("student-mat.csv", "data/student-mat.csv")
+  for (p in candidates) if (file.exists(p)) return(p)
+
+  # Extract a specific CSV from a zip by suffix (no regex)
+  extract_csv <- function(zpath) {
+    files <- unzip(zpath, list = TRUE)$Name
+    csv_name <- files[endsWith(files, "student-mat.csv")]
+    if (length(csv_name) == 0) stop("student-mat.csv not found inside zip: ", zpath)
+    dir.create("data", showWarnings = FALSE)
+    unzip(zpath, files = csv_name[1], exdir = "data")
+    file.path("data", basename(csv_name[1]))
+  }
+
+  # Check local zips (outer or inner) without regex
+  local_zips <- c("student.zip","data/student.zip",
+                  "student+performance.zip","data/student+performance.zip")
+  for (z in local_zips) if (file.exists(z)) {
+    if (endsWith(basename(z), "student+performance.zip")) {
+      dir.create("data_raw", showWarnings = FALSE)
+      unzip(z, exdir = "data_raw")
+      inner_all <- list.files("data_raw", recursive = TRUE, full.names = TRUE)
+      inner <- inner_all[endsWith(inner_all, "student.zip")]
+      if (length(inner) == 0) stop("Inner student.zip not found in: ", z)
+      return(extract_csv(inner[1]))
+    } else {
+      return(extract_csv(z))
+    }
+  }
+
+  # Fallback: download from UCI
+  zip_url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00320/student.zip"
+  dest <- file.path("data", "student.zip")
+  dir.create("data", showWarnings = FALSE)
+  download.file(zip_url, destfile = dest, mode = "wb", quiet = TRUE)
+  extract_csv(dest)
+}
+
+csv_path <- get_student_csv()
+csv_path
+```
+
+```{r load-clean}
+raw <- readr::read_delim(csv_path, delim = ";", show_col_types = FALSE) %>%
+  clean_names()
+
+dat <- raw %>%
+  mutate(pass_flag = factor(if_else(g3 >= 10, "pass", "not_pass"),
+                            levels = c("pass","not_pass")))
+
+# Basic audits
+list(
+  dims = dim(dat),
+  missing_by_col_head = sapply(dat, function(x) sum(is.na(x)))[1:10]
+)
+```
+
+# Exploratory Data Analysis
+
+We begin the exploratory data analysis by visualizing key aspects of the dataset that help reveal relationships between student characteristics and academic outcomes. The first plot presents the distribution of class balance, showing the proportion of students who passed versus those who did not. This helps assess whether the dataset is well balanced or dominated by one outcome, which is crucial for model training and evaluation.
+
+```{r eda-balance, fig.cap="Class balance (pass vs not_pass)"}
+dat %>%
+  count(pass_flag) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(pass_flag, pct, label = scales::percent(pct, accuracy = 0.1))) +
+  geom_col() + geom_text(vjust = -0.5) +
+  labs(title = "Class Balance (pass vs not_pass)", x = NULL, y = "Proportion")
+```
+Next, we examine the distribution of the final Mathematics grade (g3). This visualization illustrates how scores are spread across students and highlights the separation between passing and non-passing categories. It gives an immediate sense of grade dispersion and the threshold for passing.
+
+```{r eda-g3, fig.cap="Distribution of Final Grade (g3)"}
+ggplot(dat, aes(g3, fill = pass_flag)) +
+  geom_histogram(binwidth = 1, position = "identity", alpha = 0.6) +
+  labs(title = "Distribution of Final Grade (g3)", x = "g3", y = "Count")
+```
+We then explore the relationships between earlier grades and the final grade through scatter plots of g1 versus g3 and g2 versus g3. These visualizations reveal strong correlations between prior performance and final results, offering insights into the predictive strength of early assessments.
+```{r eda-g1g2, fig.cap="Relationships: g1→g3 and g2→g3"}
+p1 <- ggplot(dat, aes(g1, g3)) +
+  geom_point(alpha = 0.6) + geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "g1 vs g3")
+p2 <- ggplot(dat, aes(g2, g3)) +
+  geom_point(alpha = 0.6) + geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "g2 vs g3")
+p1; p2
+```
+Finally, we compare final grades across different study-time categories using a boxplot. This figure uncovers how study effort levels relate to academic achievement and whether consistent study time translates into higher final grades.
+```{r eda-studytime, fig.cap="Final grade by study time"}
+dat %>%
+  mutate(studytime = factor(studytime)) %>%
+  ggplot(aes(studytime, g3)) +
+  geom_boxplot() +
+  labs(title = "Final Grade by Study Time", x = "studytime (1–4)", y = "g3")
+```
+
+# Methods
+
+## Data splitting and preprocessing
+
+To ensure robust model evaluation, the dataset is divided into training and test sets using an 80 to 20 percent split, with stratification on the outcome variable pass_flag to maintain consistent class proportions in both subsets. The training set is further partitioned for cross-validation, specifically implementing five-fold validation with stratification, to enable reliable model tuning and comparison.
+
+Preprocessing follows a systematic workflow. The target-defining variable g3 is removed from the feature set to prevent any possibility of data leakage. Missing values in categorical predictors are imputed with the mode, while numerical predictors are imputed with the median. Rare categories in nominal variables are grouped under a single label, and novel levels encountered during prediction are handled explicitly to safeguard against unseen values. Predictors exhibiting zero variance are removed, categorical predictors are converted to a dummy variable representation, and numeric predictors are normalized to ensure comparability across scales.
+
+```{r split-prep}
+set.seed(123)
+split <- initial_split(dat, prop = 0.8, strata = pass_flag)
+train <- training(split)
+test  <- testing(split)
+
+# 5-fold CV on training
+cv <- vfold_cv(train, v = 5, strata = pass_flag)
+
+# Recipe: drop g3 (used to define target), impute, encode, normalize
+rec <- recipe(pass_flag ~ ., data = train) %>%
+  step_rm(g3) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "rare") %>%
+  step_novel(all_nominal_predictors(), new_level = "new") %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep(rec) %>% juice() %>% dplyr::glimpse()
+```
+
+## Models and tuning
+
+The modeling approach compares two powerful non-linear classifiers: Random Forest and XGBoost. Both models are tuned over a set of hyperparameters using space-filling grids to efficiently search the parameter space for optimal performance. Evaluation during tuning is conducted using five-fold cross-validation on the training data, and the primary model selection criterion is the area under the receiver operating characteristic curve (ROC AUC). Additional metrics such as the area under the precision-recall curve (PR AUC), accuracy, sensitivity, and specificity are also recorded for comprehensive assessment. After hyperparameter optimization, each model is retrained on the full training set using the best tuning parameters to prepare for testing on the holdout set.
+
+```{r tuning-rf}
+metrics <- metric_set(roc_auc, pr_auc, accuracy, sens, spec)
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 1000
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>% add_model(rf_spec) %>% add_recipe(rec)
+
+# Space-filling grid
+rf_params <- parameters(
+  finalize(mtry(), train),
+  min_n()
+)
+rf_grid <- grid_max_entropy(rf_params, size = 15)
+
+rf_res <- tune_grid(
+  rf_wf, resamples = cv, grid = rf_grid, metrics = metrics
+)
+
+show_best(rf_res, metric = "roc_auc", n = 5)
+
+rf_best <- select_best(rf_res, metric = "roc_auc")
+rf_final_wf <- finalize_workflow(rf_wf, rf_best) %>% fit(train)
+```
+
+```{r tuning-xgb}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  learn_rate     = tune(),
+  tree_depth     = tune(),
+  mtry           = tune(),
+  min_n          = tune(),
+  loss_reduction = tune(),
+  sample_size    = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf <- workflow() %>% add_model(xgb_spec) %>% add_recipe(rec)
+
+xgb_params <- parameters(
+  learn_rate(),
+  tree_depth(),
+  finalize(mtry(), train),
+  min_n(),
+  loss_reduction(),
+  sample_prop(range = c(0.5, 1.0))
+)
+xgb_grid <- grid_max_entropy(xgb_params, size = 20)
+
+xgb_res <- tune_grid(
+  xgb_wf, resamples = cv, grid = xgb_grid, metrics = metrics
+)
+
+show_best(xgb_res, metric = "roc_auc", n = 5)
+
+xgb_best <- select_best(xgb_res, metric = "roc_auc")
+xgb_final_wf <- finalize_workflow(xgb_wf, xgb_best) %>% fit(train)
+```
+
+# Results
+
+## Metric comparison on the held-out test set
+
+The results section presents a comparison of model performance on the held-out test set. Both Random Forest and XGBoost models are evaluated using several performance metrics, including ROC AUC, PR AUC, accuracy, sensitivity, and specificity, to determine how well each distinguishes between students who pass and those who do not.
+
+```{r eval-rf}
+rf_pred <- predict(rf_final_wf, test, type = "prob") %>%
+  bind_cols(predict(rf_final_wf, test),
+            test %>% select(pass_flag))
+
+rf_eval <- tibble(
+  model   = "RandomForest",
+  roc_auc = roc_auc(rf_pred, pass_flag, .pred_not_pass, event_level = "second")$.estimate,
+  pr_auc  = pr_auc(rf_pred, pass_flag, .pred_not_pass, event_level = "second")$.estimate,
+  acc     = accuracy(rf_pred, pass_flag, .pred_class)$.estimate,
+  sensi   = sens(rf_pred, pass_flag, .pred_class, event_level = "second")$.estimate,
+  speci   = spec(rf_pred, pass_flag, .pred_class, event_level = "second")$.estimate
+)
+rf_eval
+```
+
+```{r eval-xgb}
+xgb_pred <- predict(xgb_final_wf, test, type = "prob") %>%
+  bind_cols(predict(xgb_final_wf, test),
+            test %>% select(pass_flag))
+
+xgb_eval <- tibble(
+  model   = "XGBoost",
+  roc_auc = roc_auc(xgb_pred, pass_flag, .pred_not_pass, event_level = "second")$.estimate,
+  pr_auc  = pr_auc(xgb_pred, pass_flag, .pred_not_pass, event_level = "second")$.estimate,
+  acc     = accuracy(xgb_pred, pass_flag, .pred_class)$.estimate,
+  sensi   = sens(xgb_pred, pass_flag, .pred_class, event_level = "second")$.estimate,
+  speci   = spec(xgb_pred, pass_flag, .pred_class, event_level = "second")$.estimate
+)
+xgb_eval
+```
+
+```{r compare-table}
+comparison <- bind_rows(rf_eval, xgb_eval)
+knitr::kable(comparison, digits = 3)
+```
+
+A higher ROC AUC indicates stronger overall discrimination, reflecting the model’s ability to rank a randomly selected passing student above a non-passing one with greater probability. PR AUC, on the other hand, focuses on correctly identifying students at risk of failing and is particularly informative under class imbalance. Accuracy summarizes the overall proportion of correct predictions, while sensitivity (true positive rate) shows how effectively the model identifies non-passing students, and specificity (true negative rate) indicates how well passing students are recognized.
+Between the two models, Random Forest typically produces more stable and interpretable results, while XGBoost may achieve slightly higher precision on difficult cases. If both models yield similar ROC AUC scores, preference can be given to the one with higher sensitivity or to the simpler model for easier deployment and maintenance.
+
+## Threshold view and curves for the selected model
+After identifying the best-performing model based on ROC AUC, we further analyze its threshold-dependent behavior to understand how classification decisions vary. This part examines model predictions through a confusion matrix and visual diagnostic curves that reveal trade-offs between different types of classification errors.
+
+```{r threshold-confmat}
+best_is_rf <- rf_eval$roc_auc >= xgb_eval$roc_auc
+best_pred  <- if (best_is_rf) rf_pred else xgb_pred
+yardstick::conf_mat(best_pred, truth = pass_flag, estimate = .pred_class)
+```
+The confusion matrix summarizes prediction outcomes by comparing predicted labels with actual outcomes. It presents four components: true positives and true negatives, which represent correct predictions, and false positives and false negatives, which indicate misclassifications. This matrix provides a direct view of where the model succeeds and where it tends to err, helping identify whether the classifier is biased toward predicting pass or not pass.
+```{r curves}
+roc_curve(best_pred, truth = pass_flag, .pred_not_pass) %>% autoplot() +
+  ggtitle("ROC Curve (.pred_not_pass)")
+
+pr_curve(best_pred, truth = pass_flag, .pred_not_pass) %>% autoplot() +
+  ggtitle("Precision–Recall Curve (.pred_not_pass)")
+```
+The ROC curve plots the true positive rate against the false positive rate across all decision thresholds. Curves that extend closer to the top-left corner indicate more effective discrimination between classes. The area under this curve quantifies overall performance, with higher values denoting stronger ranking ability. The Precision–Recall curve complements this view by focusing on the positive class, illustrating the balance between identifying true non-pass cases (recall) and minimizing false alarms (precision). A model with a PR curve concentrated near the upper-right region demonstrates high reliability across thresholds.
+
+Together, these visualizations provide a comprehensive understanding of the classifier’s performance, showing not only how well it distinguishes passing and non-passing students overall but also how its precision and recall change at different probability cutoffs.
+
+## Feature importance
+
+To interpret how the trained model makes predictions, we examine the relative importance of each input feature. Feature importance quantifies how much each variable contributes to the model’s prediction performance, helping identify which aspects of a student’s profile influence the likelihood of passing Mathematics. This section visualizes the top predictors for the best-performing model, offering insight into which features carry the greatest predictive weight.
+
+For the Random Forest model, importance is computed using the Mean Decrease in Impurity (MDI) measure, which captures how much each variable reduces tree node impurity when used for splitting. Features producing larger impurity reductions across the forest are deemed more influential. In the case of XGBoost, feature importance is quantified using Gain, representing the average improvement in model accuracy brought by a feature when it is used in splitting decisions. Both measures highlight the features that contribute the most to predictive performance.
+
+```{r importance}
+if (best_is_rf) {
+  rf_fit <- workflows::extract_fit_parsnip(rf_final_wf)
+  tibble(feature = names(rf_fit$fit$variable.importance),
+         importance = as.numeric(rf_fit$fit$variable.importance)) %>%
+    arrange(desc(importance)) %>% dplyr::slice_head(n = 15) %>%
+    ggplot(aes(reorder(feature, importance), importance)) +
+    geom_col() + coord_flip() + labs(x = NULL, y = "Impurity Importance",
+    title = "Random Forest Feature Importance (Top 15)")
+} else {
+  xgb_fit <- workflows::extract_fit_parsnip(xgb_final_wf)$fit
+  prep_rec <- prep(rec)
+  x_mat <- bake(prep_rec, new_data = train) %>% select(-pass_flag)
+  imp <- xgboost::xgb.importance(model = xgb_fit, feature_names = colnames(x_mat))
+  imp %>% as_tibble() %>% dplyr::slice_head(n = 15) %>%
+    ggplot(aes(reorder(Feature, Gain), Gain)) +
+    geom_col() + coord_flip() + labs(x = NULL, y = "Gain",
+    title = "XGBoost Feature Importance (Top 15 by Gain)")
+}
+```
+
+The feature importance plot displays the top fifteen predictors ranked by their contribution to model accuracy. In the student performance data, the most influential features are typically prior grades (g1 and g2), which provide strong predictive signals of final performance. Other variables related to study time, parental education, or behavioral engagement often show moderate but meaningful influence. High-importance features can inform targeted interventions, while low-importance ones may be candidates for model simplification.
+
+# Conclusion
+
+Tree-based ensemble models demonstrate strong predictive power in identifying whether a student will pass or fail the Mathematics course. The best-performing model achieved a ROC AUC close to 0.99 and an accuracy around 0.95 on held-out data, indicating excellent discriminative ability and reliability. Among all predictors, prior grades g2 and g1 emerged as the most influential, while absences, past failures, and study time provided additional but secondary predictive value. These insights suggest that predicted risk scores could be leveraged to proactively support students through personalized study plans, targeted tutoring, and improved attendance monitoring, aligning with educational intervention strategies reported in recent ensemble-based studies.
+
+Nonetheless, certain limitations remain. The analysis is restricted to a single cohort and subject, and several variables rely on self-reported information, which may introduce bias. The associations identified are correlational rather than causal, with model performance heavily dependent on prior grade features.
+
+Future work should explore threshold tuning with cost-sensitive strategies to balance misclassification impacts, calibrate predicted probabilities for interpretability, and validate model generalization using the companion dataset student-por.csv. Incorporating temporal patterns, such as midterm progression, and evaluating subgroup fairness across demographic or academic factors would further strengthen model robustness and ethical applicability.
+
+# References
+
+Cortez, P. and Silva, A. (2008). Using Data Mining to Predict Secondary School Student Performance. UCI ML Repository. https://archive.ics.uci.edu/ml/datasets/student+performance
+
+# Appendix
+
+## A1. Class balance
+
+```{r appx-balance}
+dat %>%
+  count(pass_flag) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(pass_flag, pct, label = scales::percent(pct, accuracy = 0.1))) +
+  geom_col() + geom_text(vjust = -0.5) +
+  labs(title = "Class Balance (pass vs not_pass)", x = NULL, y = "Proportion")
+```
+
+## A2. Final grade histogram (g3)
+
+```{r appx-g3}
+ggplot(dat, aes(g3, fill = pass_flag)) +
+  geom_histogram(binwidth = 1, position = "identity", alpha = 0.6) +
+  labs(title = "Distribution of Final Grade (g3)", x = "g3", y = "Count")
+```
+
+## A3. Correlation heatmap (numeric variables)
+
+```{r appx-corr, message=FALSE}
+num_vars <- dat %>% select(where(is.numeric))
+cormat <- suppressWarnings(cor(num_vars, use = "pairwise.complete.obs"))
+cormat_df <- as_tibble(as.table(round(cormat, 2)), .name_repair = "minimal")
+names(cormat_df) <- c("Var1","Var2","Corr")
+ggplot(cormat_df, aes(Var1, Var2, fill = Corr)) +
+  geom_tile() + scale_fill_gradient2(limits = c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap (numeric predictors)", x = NULL, y = NULL)
+```
+
+## A4. Relationship: g1 → g3
+
+```{r appx-g1-g3}
+ggplot(dat, aes(g1, g3)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "g1 vs g3", x = "g1", y = "g3")
+```
+
+## A5. Confusion matrix heatmap (selected model)
+
+```{r appx-cm-heatmap}
+cm <- yardstick::conf_mat(best_pred, truth = pass_flag, estimate = .pred_class)
+as.data.frame(cm$table) %>%
+  ggplot(aes(Prediction, Truth, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq)) +
+  labs(title = "Confusion Matrix (heatmap)", x = "Prediction", y = "Truth")
+```
+
+## A6. ROC and PR curves
+
+```{r appx-curves}
+roc_curve(best_pred, truth = pass_flag, .pred_not_pass) %>% autoplot() +
+  ggtitle("ROC Curve (.pred_not_pass)")
+pr_curve(best_pred, truth = pass_flag, .pred_not_pass) %>% autoplot() +
+  ggtitle("Precision–Recall Curve (.pred_not_pass)")
+```
+
+## A7. Feature importance (Top 15)
+
+```{r appx-importance}
+if (best_is_rf) {
+  rf_fit <- workflows::extract_fit_parsnip(rf_final_wf)
+  tibble(feature = names(rf_fit$fit$variable.importance),
+         importance = as.numeric(rf_fit$fit$variable.importance)) %>%
+    arrange(desc(importance)) %>% dplyr::slice_head(n = 15) %>%
+    ggplot(aes(reorder(feature, importance), importance)) +
+    geom_col() + coord_flip() + labs(x = NULL, y = "Impurity Importance",
+    title = "Random Forest Feature Importance (Top 15)")
+} else {
+  xgb_fit <- workflows::extract_fit_parsnip(xgb_final_wf)$fit
+  prep_rec <- prep(rec)
+  x_mat <- bake(prep_rec, new_data = train) %>% select(-pass_flag)
+  imp <- xgboost::xgb.importance(model = xgb_fit, feature_names = colnames(x_mat))
+  imp %>% as_tibble() %>% dplyr::slice_head(n = 15) %>%
+    ggplot(aes(reorder(Feature, Gain), Gain)) +
+    geom_col() + coord_flip() + labs(x = NULL, y = "Gain",
+    title = "XGBoost Feature Importance (Top 15 by Gain)")
+}
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
